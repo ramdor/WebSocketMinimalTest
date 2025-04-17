@@ -64,9 +64,9 @@ namespace WebSocketMinimalTest
 
         private void updateButtonState(bool enabled, bool cycling)
         {
-            btnStarStopCycle.Enabled = enabled;
-            btnStarStopCycle.Text = cycling ? "Stop SPOT colour cycle" : "Start SPOT colour cycle";
-            btnStarStopCycle.Refresh();
+            btnStartStopCycle.Enabled = enabled;
+            btnStartStopCycle.Text = cycling ? "Stop SPOT colour cycle" : "Start SPOT colour cycle";
+            btnStartStopCycle.Refresh();
         }
 
         private void Form1_FormClosing(object sender, FormClosingEventArgs e)
@@ -78,7 +78,7 @@ namespace WebSocketMinimalTest
                 _colorCycleThread.Join(1000);
         }
 
-        private void btnStarStopCycle_Click(object sender, EventArgs e)
+        private void btnStartStopCycle_Click(object sender, EventArgs e)
         {
             if (_colorCycling)
             {
@@ -98,7 +98,7 @@ namespace WebSocketMinimalTest
                     {
                         Color c = FromHsv(hue, 1, 1);
                         int rgb = (c.R << 16) | (c.G << 8) | c.B;
-                        _ws.Send("SPOT:TEST,,14040000," + rgb.ToString() + ",TEST,;");
+                        _ws.Send("SPOT:MW0LGE,,14040000," + rgb.ToString() + ",TEST,;");
                         hue += 3;
                         if (hue >= 360) hue = 0;
                         Thread.Sleep(100);

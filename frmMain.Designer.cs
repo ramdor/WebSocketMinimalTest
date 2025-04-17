@@ -29,19 +29,19 @@
         private void InitializeComponent()
         {
             System.ComponentModel.ComponentResourceManager resources = new System.ComponentModel.ComponentResourceManager(typeof(frmMain));
-            this.btnStarStopCycle = new System.Windows.Forms.Button();
+            this.btnStartStopCycle = new System.Windows.Forms.Button();
             this.lblInfo = new System.Windows.Forms.Label();
             this.SuspendLayout();
             // 
-            // btnStarStopCycle
+            // btnStartStopCycle
             // 
-            this.btnStarStopCycle.Location = new System.Drawing.Point(12, 12);
-            this.btnStarStopCycle.Name = "btnStarStopCycle";
-            this.btnStarStopCycle.Size = new System.Drawing.Size(417, 71);
-            this.btnStarStopCycle.TabIndex = 0;
-            this.btnStarStopCycle.Text = "button1";
-            this.btnStarStopCycle.UseVisualStyleBackColor = true;
-            this.btnStarStopCycle.Click += new System.EventHandler(this.btnStarStopCycle_Click);
+            this.btnStartStopCycle.Location = new System.Drawing.Point(12, 12);
+            this.btnStartStopCycle.Name = "btnStartStopCycle";
+            this.btnStartStopCycle.Size = new System.Drawing.Size(417, 71);
+            this.btnStartStopCycle.TabIndex = 0;
+            this.btnStartStopCycle.Text = "button1";
+            this.btnStartStopCycle.UseVisualStyleBackColor = true;
+            this.btnStartStopCycle.Click += new System.EventHandler(this.btnStartStopCycle_Click);
             // 
             // lblInfo
             // 
@@ -61,7 +61,7 @@
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
             this.ClientSize = new System.Drawing.Size(441, 152);
             this.Controls.Add(this.lblInfo);
-            this.Controls.Add(this.btnStarStopCycle);
+            this.Controls.Add(this.btnStartStopCycle);
             this.Icon = ((System.Drawing.Icon)(resources.GetObject("$this.Icon")));
             this.MaximizeBox = false;
             this.MaximumSize = new System.Drawing.Size(457, 191);
@@ -76,7 +76,7 @@
 
         #endregion
 
-        private System.Windows.Forms.Button btnStarStopCycle;
+        private System.Windows.Forms.Button btnStartStopCycle;
         private System.Windows.Forms.Label lblInfo;
     }
 }
