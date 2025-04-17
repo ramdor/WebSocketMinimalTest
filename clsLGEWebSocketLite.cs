@@ -17,91 +17,88 @@
  */
 
 using System;
+using System.IO;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
-using System.IO;
 
 namespace WebSocketMinimalTest
 {
-    public class LGEWebSocketLite
+    public sealed class LGEWebSocketLite : IDisposable
     {
-        private string _ip;
-        private int _port;
+        private const int DEFAULT_PING_INTERVAL_SECONDS = 10;
+        private const int RECONNECT_DELAY_MILLISECONDS = 1000;
+        private const int READ_TIMEOUT_MILLISECONDS = 1000;
+
+        private readonly string _ip;
+        private readonly int _port;
+        private readonly object _syncRoot = new object();
+        private static readonly RandomNumberGenerator _rng = RandomNumberGenerator.Create();
+        private readonly ManualResetEvent _stopEvent = new ManualResetEvent(false);
+
         private TcpClient _client;
         private Stream _stream;
-        private Thread _read_thread;
-        private Thread _reconnect_thread;
+        private Thread _readThread;
+        private Thread _reconnectThread;
+
         private volatile bool _running;
         private volatile bool _reconnecting;
-        private object _lock = new object();
+        private bool _disposed;
 
         public event Action OnOpened;
         public event Action OnClosed;
         public event Action<string> OnMessage;
 
-        public bool IsConnected => _client != null && _client.Connected && _running;
+        public bool IsConnected
+        {
+            get
+            {
+                if (_client == null || !_running) return false;
+
+                Socket s = _client.Client;
+                if (s == null || !s.Connected) return false;
+
+                return !(s.Poll(0, SelectMode.SelectRead) && s.Available == 0);
+            }
+        }
 
         public LGEWebSocketLite(string ip, int port)
         {
-            _ip = ip;
+            _ip = ip ?? throw new ArgumentNullException(nameof(ip));
             _port = port;
         }
 
         public void Start()
         {
-            if (_reconnect_thread != null && _reconnect_thread.IsAlive) return;
-            Console.WriteLine("Starting WebSocket reconnect thread...");
+            if (_disposed) throw new ObjectDisposedException(nameof(LGEWebSocketLite));
+            if (_reconnectThread != null && _reconnectThread.IsAlive) return;
+
             _reconnecting = true;
-            _reconnect_thread = new Thread(reconnect_loop);
-            _reconnect_thread.IsBackground = true;
-            _reconnect_thread.Start();
+            _stopEvent.Reset();
+            _reconnectThread = new Thread(reconnectLoop) { IsBackground = true, Name = "WS‑Reconnect" };
+            _reconnectThread.Start();
         }
 
         public void Stop()
         {
-            Console.WriteLine("Stopping WebSocket...");
             _reconnecting = false;
-            close();
+            _stopEvent.Set();
+            closeInternal();
         }
 
         public void Send(string text)
         {
+            if (text == null) throw new ArgumentNullException(nameof(text));
             if (!IsConnected || _stream == null) return;
 
             try
             {
-                byte[] msg = Encoding.UTF8.GetBytes(text);
-                int len = msg.Length;
-                int header_len = 2;
-                if (len >= 126 && len <= 65535) header_len += 2;
-                else if (len > 65535) header_len += 8;
-                byte[] mask = new byte[4]; new RNGCryptoServiceProvider().GetBytes(mask);
-                header_len += 4;
-                byte[] frame = new byte[header_len + len];
-                frame[0] = 0x81;
-                if (len <= 125)
-                    frame[1] = (byte)(0x80 | len);
-                else if (len <= 65535)
-                {
-                    frame[1] = 0xFE;
-                    frame[2] = (byte)(len >> 8);
-                    frame[3] = (byte)(len & 0xFF);
-                }
-                else
-                {
-                    frame[1] = 0xFF;
-                    for (int i = 0; i < 8; i++) frame[9 - i] = (byte)(len >> (8 * i));
-                }
-                int offset = frame[1] == 0xFE ? 4 : (frame[1] == 0xFF ? 10 : 2);
-                Buffer.BlockCopy(mask, 0, frame, offset, 4);
-                offset += 4;
-                for (int i = 0; i < len; i++)
-                    frame[offset + i] = (byte)(msg[i] ^ mask[i % 4]);
+                byte[] payload = Encoding.UTF8.GetBytes(text);
+                byte[] frame = buildFrame(0x1, payload, true);
 
-                lock (_lock)
+                lock (_syncRoot)
                 {
                     if (_stream != null && _client != null && _client.Connected)
                         _stream.Write(frame, 0, frame.Length);
@@ -113,16 +110,49 @@ namespace WebSocketMinimalTest
             }
         }
 
-        private void open()
+        public void Dispose()
         {
+            if (_disposed) return;
+            Stop();
+            _disposed = true;
+            _stopEvent.Dispose();
+            GC.SuppressFinalize(this);
+        }
+
+        private void reconnectLoop()
+        {
+            while (_reconnecting && !_stopEvent.WaitOne(RECONNECT_DELAY_MILLISECONDS))
+            {
+                if (!IsConnected) openInternal();
+            }
+        }
+
+        private void openInternal()
+        {
+            if (_stopEvent.WaitOne(0)) return;
+
             try
             {
                 Console.WriteLine("Attempting to connect to WebSocket server...");
-                _client = new TcpClient(_ip, _port);
+
+                _client = new TcpClient();
+                IAsyncResult ar = _client.BeginConnect(_ip, _port, null, null);
+                WaitHandle handle = ar.AsyncWaitHandle;
+                bool connected = handle.WaitOne(RECONNECT_DELAY_MILLISECONDS);
+                if (!connected || !_client.Connected)
+                {
+                    Console.WriteLine("TCP connect timeout");
+                    _client.Close();
+                    return;
+                }
+                _client.EndConnect(ar);
+
                 Stream baseStream = _client.GetStream();
+
                 if (_port == 443)
                 {
-                    SslStream ssl = new SslStream(baseStream, false, (s, cert, chain, errors) => true);
+                    RemoteCertificateValidationCallback cv = validateServerCertificate;
+                    SslStream ssl = new SslStream(baseStream, false, cv);
                     ssl.AuthenticateAsClient(_ip);
                     _stream = ssl;
                 }
@@ -130,114 +160,197 @@ namespace WebSocketMinimalTest
                 {
                     _stream = baseStream;
                 }
-                _stream.ReadTimeout = 1000;
+
+                _stream.ReadTimeout = READ_TIMEOUT_MILLISECONDS;
+
                 string key = Convert.ToBase64String(Guid.NewGuid().ToByteArray());
-                string req = "GET / HTTP/1.1\r\nHost: " + _ip + ":" + _port + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
-                byte[] b = Encoding.ASCII.GetBytes(req);
-                _stream.Write(b, 0, b.Length);
-                byte[] handshake_buf = new byte[1024];
-                int n = _stream.Read(handshake_buf, 0, handshake_buf.Length);
-                string resp = Encoding.ASCII.GetString(handshake_buf, 0, n);
-                if (!resp.Contains(" 101 ") || !resp.ToLower().Contains("upgrade: websocket"))
+                StringBuilder sb = new StringBuilder()
+                    .Append("GET / HTTP/1.1\r\n")
+                    .Append("Host: ").Append(_ip).Append(':').Append(_port).Append("\r\n")
+                    .Append("Upgrade: websocket\r\nConnection: Upgrade\r\n")
+                    .Append("Sec-WebSocket-Key: ").Append(key).Append("\r\n")
+                    .Append("Sec-WebSocket-Version: 13\r\n\r\n");
+
+                byte[] request = Encoding.ASCII.GetBytes(sb.ToString());
+                _stream.Write(request, 0, request.Length);
+
+                byte[] respBuf = new byte[1024];
+                int bytes = _stream.Read(respBuf, 0, respBuf.Length);
+                string resp = Encoding.ASCII.GetString(respBuf, 0, bytes);
+
+                if (!resp.Contains(" 101 ") || !resp.ToLowerInvariant().Contains("upgrade: websocket"))
                 {
                     Console.WriteLine("WebSocket handshake failed");
                     _stream.Close();
                     _client.Close();
                     return;
                 }
+
                 Console.WriteLine("WebSocket connected");
                 _running = true;
-                _read_thread = new Thread(read_loop);
-                _read_thread.Start();
+                _readThread = new Thread(readLoop) { IsBackground = true, Name = "WS‑Read" };
+                _readThread.Start();
                 OnOpened?.Invoke();
             }
             catch (Exception ex)
             {
                 Console.WriteLine("WebSocket connection error: " + ex.Message);
-                try
-                {
-                    _stream?.Close();
-                    _client?.Close();
-                }
-                catch { }
+                try { _stream?.Close(); } catch { }
+                try { _client?.Close(); } catch { }
             }
         }
 
-        private void close()
+        private void closeInternal()
         {
-            Console.WriteLine("Closing WebSocket...");
-            Thread thread_to_join = _read_thread;
-            _read_thread = null;
+            Thread t = _readThread;
+            _readThread = null;
             _running = false;
 
             try
             {
                 if (_stream != null && _client != null && _client.Connected)
                 {
-                    byte[] close_frame = new byte[6];
-                    close_frame[0] = 0x88;
-                    close_frame[1] = 0x80 | 2;
-                    byte[] mask = new byte[4]; new RNGCryptoServiceProvider().GetBytes(mask);
-                    close_frame[2] = mask[0]; close_frame[3] = mask[1];
-                    close_frame[4] = mask[2]; close_frame[5] = mask[3];
-                    ushort status = 1000;
-                    byte b1 = (byte)(status >> 8);
-                    byte b2 = (byte)(status & 0xFF);
-                    byte masked_b1 = (byte)(b1 ^ mask[0]);
-                    byte masked_b2 = (byte)(b2 ^ mask[1]);
-                    _stream.WriteByte(close_frame[0]);
-                    _stream.WriteByte(close_frame[1]);
-                    _stream.Write(mask, 0, 4);
-                    _stream.WriteByte(masked_b1);
-                    _stream.WriteByte(masked_b2);
+                    ushort code = 1000;
+                    byte[] payload = { (byte)(code >> 8), (byte)(code & 0xFF) };
+                    byte[] frame = buildFrame(0x8, payload, true);
+
+                    _stream.Write(frame, 0, frame.Length);
                     _stream.Flush();
                 }
             }
             catch { }
 
-            try
-            {
-                _stream?.Close();
-                _client?.Close();
-            }
-            catch { }
+            try { _stream?.Close(); } catch { }
+            try { _client?.Close(); } catch { }
 
-            try
+            if (t != null && t.IsAlive && t != Thread.CurrentThread)
             {
-                if (thread_to_join != null && thread_to_join.IsAlive && thread_to_join != Thread.CurrentThread)
-                {
-                    thread_to_join.Interrupt();
-                    if (!thread_to_join.Join(1000)) Console.WriteLine("Warning: read thread did not exit in time.");
-                }
+                t.Interrupt();
+                if (!t.Join(1000))
+                    Console.WriteLine("Warning: read thread did not exit in time.");
             }
-            catch { }
 
             Console.WriteLine("WebSocket disconnected");
             OnClosed?.Invoke();
         }
 
-        private void reconnect_loop()
+        private void readLoop()
         {
-            while (_reconnecting)
+            DateTime lastPing = DateTime.UtcNow;
+
+            try
             {
-                if (!IsConnected)
+                while (_running && !_stopEvent.WaitOne(0))
                 {
-                    Console.WriteLine("Reconnecting to WebSocket...");
-                    open();
+                    bool more = false;
+                    try
+                    {
+                        NetworkStream ns = _stream as NetworkStream;
+                        if (_stream.CanRead && ns != null && ns.DataAvailable)
+                            more = processIncomingFrame();
+                    }
+                    catch
+                    {
+                        _running = false;
+                    }
+
+                    if ((DateTime.UtcNow - lastPing).TotalSeconds >= DEFAULT_PING_INTERVAL_SECONDS)
+                    {
+                        sendPing();
+                        lastPing = DateTime.UtcNow;
+                    }
+
+                    if (!more) Thread.Sleep(10);
                 }
-                Thread.Sleep(5000);
+            }
+            catch (ThreadInterruptedException) { }
+            finally
+            {
+                Console.WriteLine("Out of read loop.");
+                closeInternal();
             }
         }
 
-        private void send_ping()
+        private bool processIncomingFrame()
+        {
+            int b1 = _stream.ReadByte();
+            int b2 = _stream.ReadByte();
+            if (b1 == -1 || b2 == -1) throw new IOException("Stream closed");
+
+            bool mask = (b2 & 0x80) != 0;
+            int op = b1 & 0x0F;
+            int lenFlag = b2 & 0x7F;
+            int len = lenFlag;
+
+            if (lenFlag == 126)
+            {
+                byte[] ext = new byte[2];
+                readExactly(ext, 0, 2);
+                len = (ext[0] << 8) | ext[1];
+            }
+            else if (lenFlag == 127)
+            {
+                byte[] ext = new byte[8];
+                readExactly(ext, 0, 8);
+                long l = ((long)ext[0] << 56) | ((long)ext[1] << 48) | ((long)ext[2] << 40) | ((long)ext[3] << 32) |
+                         ((long)ext[4] << 24) | ((long)ext[5] << 16) | ((long)ext[6] << 8) | ext[7];
+                if (l > int.MaxValue) throw new NotSupportedException("Frame too large.");
+                len = (int)l;
+            }
+
+            byte[] key = null;
+            if (mask)
+            {
+                key = new byte[4];
+                readExactly(key, 0, 4);
+            }
+
+            byte[] payload = new byte[len];
+            if (len > 0) readExactly(payload, 0, len);
+
+            if (mask && len > 0)
+                for (int i = 0; i < len; i++)
+                    payload[i] = (byte)(payload[i] ^ key[i % 4]);
+
+            switch (op)
+            {
+                case 0x1:
+                    try { OnMessage?.Invoke(Encoding.UTF8.GetString(payload)); } catch { }
+                    break;
+                case 0x8:
+                    Console.WriteLine("Close frame received");
+                    _running = false;
+                    break;
+                case 0x9:
+                    sendPong(payload);
+                    Console.WriteLine("Ping received");
+                    break;
+                case 0xA:
+                    Console.WriteLine("Pong received");
+                    break;
+            }
+
+            NetworkStream ns2 = _stream as NetworkStream;
+            return ns2 != null && ns2.DataAvailable;
+        }
+
+        private void readExactly(byte[] buffer, int offset, int count)
+        {
+            int read = 0;
+            while (read < count)
+            {
+                int n = _stream.Read(buffer, offset + read, count - read);
+                if (n == 0) throw new IOException("Disconnected");
+                read += n;
+            }
+        }
+
+        private void sendPing()
         {
             try
             {
-                byte[] ping = new byte[2];
-                ping[0] = 0x89;
-                ping[1] = 0x00;
-                lock (_lock) _stream.Write(ping, 0, 2);
-                Console.WriteLine("Ping sent");
+                byte[] frame = buildFrame(0x9, Array.Empty<byte>(), true);
+                lock (_syncRoot) _stream.Write(frame, 0, frame.Length);
             }
             catch (Exception ex)
             {
@@ -245,17 +358,12 @@ namespace WebSocketMinimalTest
             }
         }
 
-        private void send_pong(byte[] payload)
+        private void sendPong(byte[] payload)
         {
             try
             {
-                int len = payload.Length;
-                byte[] frame = new byte[2 + len];
-                frame[0] = 0x8A;
-                frame[1] = (byte)(len & 0x7F);
-                Buffer.BlockCopy(payload, 0, frame, 2, len);
-                lock (_lock) _stream.Write(frame, 0, frame.Length);
-                Console.WriteLine("Pong sent");
+                byte[] frame = buildFrame(0xA, payload, true);
+                lock (_syncRoot) _stream.Write(frame, 0, frame.Length);
             }
             catch (Exception ex)
             {
@@ -263,93 +371,74 @@ namespace WebSocketMinimalTest
             }
         }
 
-        private void read_loop()
+        private static byte[] buildFrame(byte opcode, byte[] payload, bool mask)
         {
-            DateTime last_ping = DateTime.Now;
-            try
+            int len = payload?.Length ?? 0;
+            int hdr = 2;
+
+            if (len >= 126 && len <= 65535) hdr += 2;
+            else if (len > 65535) hdr += 8;
+
+            byte[] key = null;
+            if (mask)
             {
-                while (_running)
+                key = new byte[4];
+                _rng.GetBytes(key);
+                hdr += 4;
+            }
+
+            byte[] frame = new byte[hdr + len];
+            frame[0] = (byte)(0x80 | opcode);
+
+            if (len <= 125)
+            {
+                frame[1] = (byte)((mask ? 0x80 : 0) | len);
+            }
+            else if (len <= 65535)
+            {
+                frame[1] = (byte)((mask ? 0x80 : 0) | 126);
+                frame[2] = (byte)(len >> 8);
+                frame[3] = (byte)(len & 0xFF);
+            }
+            else
+            {
+                frame[1] = (byte)((mask ? 0x80 : 0) | 127);
+                for (int i = 0; i < 8; i++)
+                    frame[9 - i] = (byte)(len >> (8 * i));
+            }
+
+            int off = 2;
+            if (len >= 126 && len <= 65535) off = 4;
+            else if (len > 65535) off = 10;
+
+            if (mask)
+            {
+                Buffer.BlockCopy(key, 0, frame, off, 4);
+                off += 4;
+            }
+
+            if (len > 0)
+            {
+                if (mask)
                 {
-                    try
-                    {
-                        bool data_sill_available = false;
-                        if (_stream.CanRead && _stream is NetworkStream ns && ns.DataAvailable)
-                        {
-                            int h1 = _stream.ReadByte();
-                            int h2 = _stream.ReadByte();
-                            if (h1 == -1 || h2 == -1) throw new IOException("Stream closed");
-                            bool fin = (h1 & 0x80) != 0;
-                            int opcode = h1 & 0x0F;
-                            bool masked = (h2 & 0x80) != 0;
-                            int len = h2 & 0x7F;
-                            if (len == 126)
-                            {
-                                byte[] ext = new byte[2]; _stream.Read(ext, 0, 2); len = (ext[0] << 8) | ext[1];
-                            }
-                            else if (len == 127)
-                            {
-                                byte[] ext = new byte[8]; _stream.Read(ext, 0, 8);
-                                len = (int)(((long)ext[0] << 56) | ((long)ext[1] << 48) | ((long)ext[2] << 40) | ((long)ext[3] << 32) |
-                                            ((long)ext[4] << 24) | ((long)ext[5] << 16) | ((long)ext[6] << 8) | ext[7]);
-                            }
-                            byte[] mask = masked ? new byte[4] : null;
-                            if (masked) _stream.Read(mask, 0, 4);
-                            byte[] payload = new byte[len];
-                            int read = 0;
-                            while (read < len)
-                            {
-                                int r = _stream.Read(payload, read, len - read);
-                                if (r == 0) throw new IOException("Disconnected");
-                                read += r;
-                            }
-                            if (masked)
-                                for (int i = 0; i < len; i++)
-                                    payload[i] = (byte)(payload[i] ^ mask[i % 4]);
-
-                            switch (opcode)
-                            {
-                                case 0x1:
-                                    string text = null;
-                                    try { text = Encoding.UTF8.GetString(payload); } catch { }
-                                    if (text != null) OnMessage?.Invoke(text);
-                                    break;
-                                case 0x2:
-                                    break;
-                                case 0x8:
-                                    Console.WriteLine("Close frame received");
-                                    _running = false;
-                                    break;
-                                case 0x9:
-                                    send_pong(payload);
-                                    Console.WriteLine("Ping received");
-                                    break;
-                                case 0xA:
-                                    Console.WriteLine("Pong received");
-                                    break;
-                            }
-                            data_sill_available = ns.DataAvailable;
-                        }
-
-                        if ((DateTime.Now - last_ping).TotalSeconds >= 10)
-                        {
-                            send_ping();
-                            last_ping = DateTime.Now;
-                        }
-
-                        if(!data_sill_available) Thread.Sleep(10);
-                    }
-                    catch
-                    {
-                        _running = false;
-                    }
+                    for (int i = 0; i < len; i++)
+                        frame[off + i] = (byte)(payload[i] ^ key[i % 4]);
+                }
+                else
+                {
+                    Buffer.BlockCopy(payload, 0, frame, off, len);
                 }
             }
-            catch (ThreadInterruptedException) { }
-            finally
-            {
-                Console.WriteLine("Out of read loop.");
-                close();
-            }
+
+            return frame;
+        }
+
+        private static bool validateServerCertificate(object sender,
+                                                      System.Security.Cryptography.X509Certificates.X509Certificate cert,
+                                                      System.Security.Cryptography.X509Certificates.X509Chain chain,
+                                                      SslPolicyErrors errors)
+        {
+            return errors == SslPolicyErrors.None;
         }
     }
 }
