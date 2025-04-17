@@ -23,13 +23,13 @@ using System.Threading;
 
 namespace WebSocketMinimalTest
 {
-    public partial class Form1 : Form
+    public partial class frmMain : Form
     {
         private LGEWebSocketLite _ws;
         private Thread _colorCycleThread;
         private volatile bool _colorCycling;
 
-        public Form1()
+        public frmMain()
         {
             InitializeComponent();
 
