@@ -69,6 +69,8 @@ namespace WebSocketMinimalTest
 
         public void Send(string text)
         {
+            if (!IsConnected || _stream == null) return;
+
             try
             {
                 byte[] msg = Encoding.UTF8.GetBytes(text);
@@ -98,9 +100,17 @@ namespace WebSocketMinimalTest
                 offset += 4;
                 for (int i = 0; i < len; i++)
                     frame[offset + i] = (byte)(msg[i] ^ mask[i % 4]);
-                lock (_lock) _stream.Write(frame, 0, frame.Length);
+
+                lock (_lock)
+                {
+                    if (_stream != null && _client != null && _client.Connected)
+                        _stream.Write(frame, 0, frame.Length);
+                }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Send error: " + ex.Message);
+            }
         }
 
         private void open()
@@ -156,7 +166,10 @@ namespace WebSocketMinimalTest
         private void close()
         {
             Console.WriteLine("Closing WebSocket...");
+            Thread thread_to_join = _read_thread;
+            _read_thread = null;
             _running = false;
+
             try
             {
                 if (_stream != null && _client != null && _client.Connected)
@@ -182,16 +195,23 @@ namespace WebSocketMinimalTest
             }
             catch { }
 
-            try { _stream?.Close(); _client?.Close(); } catch { }
             try
             {
-                if (_read_thread != null && _read_thread.IsAlive)
-                {
-                    if (!_read_thread.Join(2000)) Console.WriteLine("Warning: read thread did not exit in time.");
-                }
-                _read_thread = null;
+                _stream?.Close();
+                _client?.Close();
             }
             catch { }
+
+            try
+            {
+                if (thread_to_join != null && thread_to_join.IsAlive && thread_to_join != Thread.CurrentThread)
+                {
+                    thread_to_join.Interrupt();
+                    if (!thread_to_join.Join(1000)) Console.WriteLine("Warning: read thread did not exit in time.");
+                }
+            }
+            catch { }
+
             Console.WriteLine("WebSocket disconnected");
             OnClosed?.Invoke();
         }
@@ -246,61 +266,89 @@ namespace WebSocketMinimalTest
         private void read_loop()
         {
             DateTime last_ping = DateTime.Now;
-            while (_running)
+            try
             {
-                try
+                while (_running)
                 {
-                    if (_stream.CanRead && _stream is NetworkStream ns && ns.DataAvailable)
+                    try
                     {
-                        int h1 = _stream.ReadByte();
-                        int h2 = _stream.ReadByte();
-                        if (h1 == -1 || h2 == -1) throw new IOException("Stream closed");
-                        bool fin = (h1 & 0x80) != 0;
-                        int opcode = h1 & 0x0F;
-                        bool masked = (h2 & 0x80) != 0;
-                        int len = h2 & 0x7F;
-                        if (len == 126)
+                        bool data_sill_available = false;
+                        if (_stream.CanRead && _stream is NetworkStream ns && ns.DataAvailable)
                         {
-                            byte[] ext = new byte[2]; _stream.Read(ext, 0, 2); len = (ext[0] << 8) | ext[1];
+                            int h1 = _stream.ReadByte();
+                            int h2 = _stream.ReadByte();
+                            if (h1 == -1 || h2 == -1) throw new IOException("Stream closed");
+                            bool fin = (h1 & 0x80) != 0;
+                            int opcode = h1 & 0x0F;
+                            bool masked = (h2 & 0x80) != 0;
+                            int len = h2 & 0x7F;
+                            if (len == 126)
+                            {
+                                byte[] ext = new byte[2]; _stream.Read(ext, 0, 2); len = (ext[0] << 8) | ext[1];
+                            }
+                            else if (len == 127)
+                            {
+                                byte[] ext = new byte[8]; _stream.Read(ext, 0, 8);
+                                len = (int)(((long)ext[0] << 56) | ((long)ext[1] << 48) | ((long)ext[2] << 40) | ((long)ext[3] << 32) |
+                                            ((long)ext[4] << 24) | ((long)ext[5] << 16) | ((long)ext[6] << 8) | ext[7]);
+                            }
+                            byte[] mask = masked ? new byte[4] : null;
+                            if (masked) _stream.Read(mask, 0, 4);
+                            byte[] payload = new byte[len];
+                            int read = 0;
+                            while (read < len)
+                            {
+                                int r = _stream.Read(payload, read, len - read);
+                                if (r == 0) throw new IOException("Disconnected");
+                                read += r;
+                            }
+                            if (masked)
+                                for (int i = 0; i < len; i++)
+                                    payload[i] = (byte)(payload[i] ^ mask[i % 4]);
+
+                            switch (opcode)
+                            {
+                                case 0x1:
+                                    string text = null;
+                                    try { text = Encoding.UTF8.GetString(payload); } catch { }
+                                    if (text != null) OnMessage?.Invoke(text);
+                                    break;
+                                case 0x2:
+                                    break;
+                                case 0x8:
+                                    Console.WriteLine("Close frame received");
+                                    _running = false;
+                                    break;
+                                case 0x9:
+                                    send_pong(payload);
+                                    Console.WriteLine("Ping received");
+                                    break;
+                                case 0xA:
+                                    Console.WriteLine("Pong received");
+                                    break;
+                            }
+                            data_sill_available = ns.DataAvailable;
                         }
-                        else if (len == 127)
+
+                        if ((DateTime.Now - last_ping).TotalSeconds >= 10)
                         {
-                            byte[] ext = new byte[8]; _stream.Read(ext, 0, 8);
-                            len = (int)(((long)ext[0] << 56) | ((long)ext[1] << 48) | ((long)ext[2] << 40) | ((long)ext[3] << 32) |
-                                        ((long)ext[4] << 24) | ((long)ext[5] << 16) | ((long)ext[6] << 8) | ext[7]);
+                            send_ping();
+                            last_ping = DateTime.Now;
                         }
-                        byte[] mask = masked ? new byte[4] : null;
-                        if (masked) _stream.Read(mask, 0, 4);
-                        byte[] payload = new byte[len];
-                        int read = 0;
-                        while (read < len)
-                        {
-                            int r = _stream.Read(payload, read, len - read);
-                            if (r == 0) throw new IOException("Disconnected");
-                            read += r;
-                        }
-                        if (masked)
-                            for (int i = 0; i < len; i++)
-                                payload[i] = (byte)(payload[i] ^ mask[i % 4]);
-                        if (opcode == 0x1)
-                        {
-                            string text;
-                            try { text = Encoding.UTF8.GetString(payload); } catch { text = null; }
-                            if (text != null) OnMessage?.Invoke(text);
-                        }
-                        else if (opcode == 0x2) { }
-                        else if (opcode == 0x8) { close(); return; }
-                        else if (opcode == 0x9) { send_pong(payload); Console.WriteLine("Ping received"); }
-                        else if (opcode == 0xA) { Console.WriteLine("Pong received"); }
+
+                        if(!data_sill_available) Thread.Sleep(10);
                     }
-                    if ((DateTime.Now - last_ping).TotalSeconds >= 10)
+                    catch
                     {
-                        send_ping();
-                        last_ping = DateTime.Now;
+                        _running = false;
                     }
-                    Thread.Sleep(10);
                 }
-                catch { close(); }
+            }
+            catch (ThreadInterruptedException) { }
+            finally
+            {
+                Console.WriteLine("Out of read loop.");
+                close();
             }
         }
     }
