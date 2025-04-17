@@ -6,11 +6,11 @@ using System.Runtime.InteropServices;
 // set of attributes. Change these attribute values to modify the information
 // associated with an assembly.
 [assembly: AssemblyTitle("WebSocketMinimalTest")]
-[assembly: AssemblyDescription("")]
+[assembly: AssemblyDescription("A WebSocket minimal test")]
 [assembly: AssemblyConfiguration("")]
-[assembly: AssemblyCompany("")]
+[assembly: AssemblyCompany("Blitter8 Ltd.")]
 [assembly: AssemblyProduct("WebSocketMinimalTest")]
-[assembly: AssemblyCopyright("Copyright ©  2025")]
+[assembly: AssemblyCopyright("Copyright ©  2025 - Richard Samphire - MW0LGE")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
 
