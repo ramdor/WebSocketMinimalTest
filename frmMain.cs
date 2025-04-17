@@ -64,9 +64,9 @@ namespace WebSocketMinimalTest
 
         private void updateButtonState(bool enabled, bool cycling)
         {
-            button1.Enabled = enabled;
-            button1.Text = cycling ? "Stop SPOT colour cycle" : "Start SPOT colour cycle";
-            button1.Refresh();
+            btnStarStopCycle.Enabled = enabled;
+            btnStarStopCycle.Text = cycling ? "Stop SPOT colour cycle" : "Start SPOT colour cycle";
+            btnStarStopCycle.Refresh();
         }
 
         private void Form1_FormClosing(object sender, FormClosingEventArgs e)
@@ -78,7 +78,7 @@ namespace WebSocketMinimalTest
                 _colorCycleThread.Join(1000);
         }
 
-        private void button1_Click(object sender, EventArgs e)
+        private void btnStarStopCycle_Click(object sender, EventArgs e)
         {
             if (_colorCycling)
             {
